@@ -1,0 +1,69 @@
+Apache Arrow's IPC (Arrow-file/stream) reader supports "dictionary batches" for
+dictionary-encoded columns, including "delta" dictionary batches whose values get
+appended (concatenated) onto a dictionary that was already registered from an
+earlier batch earlier in the same file. This crash is produced by a crafted file
+whose delta dictionary batch is a Binary-typed array with an internally
+inconsistent shape.
+
+Crash mechanism (derived from error.txt, not copied from crash.json): the
+sanitizer reports a heap-buffer-overflow READ of size 385875977 bytes (roughly
+368 MB) at an address exactly 0 bytes past the end of a 64-byte heap region. The
+offending read happens inside the low-level memory-copy call made while the
+array's value-data buffer is being copied into a freshly-allocated concatenated
+output buffer. The call chain leading there (all visible in the stack trace) is:
+decode a record batch from an Arrow IPC file -> read the dictionary batches that
+record batch depends on -> merge a "delta" dictionary array into the dictionary
+already registered for that dictionary id -> the generic array-concatenation
+entry point -> the Binary-type-specific concatenation branch -> the buffer-copy
+helper that issues the actual copy.
+
+The huge, obviously-bogus read size is not incidental: it is exactly what you get
+from subtracting the array's first committed value-offset from its last
+value-offset (i.e. `value_offset(length) - value_offset(0)`, the span of bytes
+the array's own offsets buffer claims its value-data buffer holds). The array
+declares a span of roughly 368 MB, while the value-data buffer that was actually
+allocated for it (sized from the real IPC message body, which is at most a few
+KB here) is only 64 bytes. Nothing on this path checked that the declared span,
+or even the two individual offset endpoints, stayed within the bounds of the
+real buffer before the buffer-copy helper unconditionally issued a single copy
+of that bogus length. This is a "declared shape lies about the real allocation"
+bug, not a simple off-by-one: the array's own offsets metadata is untrustworthy
+and nothing validated it before it drove a raw memory copy.
+
+fix_commit plausibility: high confidence, for two independent, complementary
+reasons, both visible directly in the diff:
+1. The reader's dictionary-batch handling now runs every incoming dictionary
+   array through the project's shared array-validation routine before that
+   array is ever handed to the delta-dictionary accumulation logic. Previously
+   that validation call was simply absent from this code path -- a dictionary
+   batch's array shape was never checked at all before being fed into
+   concatenation.
+2. Specifically for Binary/String/LargeBinary-typed arrays, the validation
+   routine gains brand-new logic that computes precisely the quantity that
+   appears (wrongly) as this crash's read size -- last offset minus first
+   offset -- and rejects the array if that span exceeds the real size of its
+   value-data buffer. It separately rejects an array whose first or last offset
+   individually falls outside the value-data buffer's bounds, and rejects
+   offsets that are not monotonically non-decreasing. This is genuinely new
+   logic (not a pre-existing check merely being reached for the first time),
+   and it targets exactly the arithmetic that goes wrong in this stack trace --
+   about as specific a correspondence between a crash and its fix as this class
+   of bug gets.
+
+Relationship to the other id sharing this same fix_commit: that id triggers a
+different concrete defect that this same commit happens to close, by corrupting
+a different part of an array's self-reported shape -- its element count /
+validity-bitmap sizing, not its variable-length value-offsets -- and it is
+caught by the *other* half of the fix described above (the now-always-invoked
+shared validation call, via a check that already existed elsewhere in that
+routine before this commit, unrelated to the new offset-span logic above),
+rather than by the new offset-span check described here. The two crashes
+exercise different internal sub-routines of the array-concatenation machinery
+(a byte-range buffer copy for variable-length value data, versus a bit-level
+copy of a validity/null bitmap), are observed at different source locations,
+and have different ASan read sizes (a huge fabricated span here vs. a fixed
+8-byte machine-word read in the other id). They are two distinct ways a delta
+dictionary array's declared shape can be untrue to its real backing buffer --
+one on the offsets side, one on the null-bitmap side -- not two observations of
+one identical bug; a single commit's added validation call simply happens to
+close both gaps at once.

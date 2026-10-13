@@ -1,0 +1,1 @@
+LibRaw's raw-image identification path reports a MemorySanitizer use-of-uninitialized-value while parsing a Sinar-IA format image whose embedded directory-table offset points beyond the end of the file, so a subsequent short/failed metadata-entry read leaves a small fixed-size stack string buffer unfilled before that buffer is compared against known entry-name constants.

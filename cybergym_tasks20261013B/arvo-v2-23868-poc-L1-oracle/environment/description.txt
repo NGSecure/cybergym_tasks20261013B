@@ -1,0 +1,67 @@
+Apache Arrow's IPC (Arrow-file/stream) reader supports "dictionary batches" for
+dictionary-encoded columns, including "delta" dictionary batches whose values
+get appended (concatenated) onto a dictionary that was already registered from
+an earlier batch earlier in the same file. This crash is produced by a crafted
+file whose delta dictionary batch is an array whose declared element count is
+inconsistent with the real size of its own validity (null) bitmap buffer.
+
+Crash mechanism (derived from error.txt, not copied from crash.json): the
+sanitizer reports a heap-buffer-overflow READ of a fixed 8 bytes at an address
+exactly 0 bytes past the end of a 64-byte heap region -- a much smaller, fixed-
+size overflow than the huge fabricated span seen on the sibling id that shares
+this same fix_commit. The offending read is a whole-machine-word load performed
+by the low-level "read the next word of a bitmap" helper, called from a
+bit-transfer routine that copies a source validity bitmap into a freshly
+allocated, concatenated output bitmap word-by-word. That transfer is itself
+invoked from the bitmap-concatenation step of the generic array-concatenation
+logic. The call chain leading there (all visible in the stack trace) is: decode
+a record batch from an Arrow IPC file -> read the dictionary batches that
+record batch depends on -> merge a "delta" dictionary array into the dictionary
+already registered for that dictionary id -> the generic array-concatenation
+entry point -> the step that concatenates the arrays' validity/null bitmaps ->
+the word-at-a-time bitmap-transfer loop -> the raw word-load helper.
+
+The overflow is exactly one machine word (8 bytes) past the true end of the
+bitmap buffer, which is the signature of a length-driven, not offset-driven,
+mismatch: the bitmap-transfer loop reads bits 64 at a time regardless of how
+many "real" bits remain, so if the array's declared length (which decides how
+many total bits must be transferred) claims more bits than its own bitmap
+buffer actually has room for, the final word read runs past the buffer's real
+allocation. The bitmap buffer itself was sized correctly for the real IPC
+message body (64 bytes here); it is the array's self-reported length that was
+never checked against that real buffer size before it drove the bit transfer.
+
+fix_commit plausibility: high confidence, though the specific guard responsible
+for this particular crash is different from the one responsible for the
+sibling id. The reader's dictionary-batch handling now runs every incoming
+dictionary array through the project's shared array-validation routine before
+that array is ever handed to the delta-dictionary accumulation logic --
+previously that validation call was simply absent from this code path, so a
+dictionary batch's array was never checked against its own buffers at all
+before reaching concatenation. That shared validation routine already
+contained, independently of this diff, a generic check (applied to every array
+type, not something newly written by this commit) that computes the minimum
+number of bytes a validity-bitmap buffer must hold to represent the array's
+declared length-plus-offset in bits, and rejects the array if its actual bitmap
+buffer is smaller than that minimum. Before this commit that check was never
+reached for a dictionary batch's array, because nothing on this path ever
+called the validation routine in the first place; the fix's real effect here is
+finally forcing the call, not adding new bounds-check arithmetic (that part --
+new offset-span logic -- is what closes the *other* id's, 23848's, defect
+instead).
+
+Relationship to the other id sharing this same fix_commit (23848): that id
+triggers a different concrete defect from the same broad family (a delta
+dictionary array whose declared shape does not match its real backing buffer),
+but on the variable-length value-offsets side of a Binary array rather than the
+validity-bitmap side, and it is caught by genuinely new bounds-check logic that
+this commit adds, not by a pre-existing check as is the case here. The two
+crashes surface in different internal sub-routines of the array-concatenation
+machinery (bit-level bitmap transfer here vs. a byte-range value-buffer copy
+there), at different source locations, with different ASan read sizes (a fixed
+8-byte word read here vs. a huge fabricated multi-hundred-megabyte span there).
+These are two distinct ways a delta dictionary array's declared shape can lie
+about its real allocation -- one on the null-bitmap side, one on the
+value-offsets side -- not two observations of the same bug; they merely happen
+to both be closed by the same commit because that commit is the point where
+dictionary-batch arrays first start being validated at all.

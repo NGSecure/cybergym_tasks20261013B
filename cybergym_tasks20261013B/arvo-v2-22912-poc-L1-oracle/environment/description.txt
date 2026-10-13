@@ -1,0 +1,3 @@
+nDPI's UDP-based Spotify protocol dissector performs a fixed-length magic-string comparison against the start of the packet payload without first confirming the payload actually holds enough bytes for that comparison.
+
+Root cause: before comparing the beginning of the payload against a 7-byte reference string, the dissector only checks that the payload length exceeds a much smaller threshold (just a couple of bytes), not that it is at least as long as the reference string. A UDP packet on the Spotify port whose payload length passes that smaller threshold but is still shorter than the reference string causes the fixed-length comparison to read past the end of the allocated payload buffer, triggering a heap-buffer-overflow read of a few bytes beyond the buffer's end.
